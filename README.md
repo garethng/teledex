@@ -121,8 +121,18 @@ Start the bridge:
 teledex run
 ```
 
-If the bridge is not paired yet, it prints a one-time pairing code locally. Send that code to the
-Telegram bot from the chat you want to authorize.
+`teledex run` starts the bridge as a background process and returns immediately.
+
+If the bridge is not paired yet, it prints a one-time pairing code locally before daemonizing. Send
+that code to the Telegram bot from the chat you want to authorize.
+
+Useful lifecycle commands:
+
+```bash
+teledex status
+teledex stop
+teledex restart
+```
 
 ## Telegram Usage
 
@@ -148,6 +158,8 @@ Built-in bot commands:
 ```bash
 teledex init
 teledex run
+teledex restart
+teledex stop
 teledex status
 teledex unpair
 ```

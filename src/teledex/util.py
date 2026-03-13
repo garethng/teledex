@@ -81,3 +81,24 @@ def chunk_text(text: str, limit: int = 3500) -> list[str]:
     if text:
         chunks.append(text)
     return chunks
+
+
+def normalize_telegram_slash_command(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("/"):
+        return text
+    first, sep, rest = text.partition(" ")
+    command, at, _bot = first.partition("@")
+    command = _telegram_command_alias_to_codex(command)
+    normalized = command
+    if sep:
+        normalized = f"{normalized} {rest.strip()}"
+    return normalized.strip()
+
+
+def _telegram_command_alias_to_codex(command: str) -> str:
+    aliases = {
+        "/sandbox_add_read_dir": "/sandbox-add-read-dir",
+        "/debug_config": "/debug-config",
+    }
+    return aliases.get(command, command)

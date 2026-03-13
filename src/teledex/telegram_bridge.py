@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -26,10 +26,49 @@ from .config import Settings
 from .interactions import InteractionPrompt
 from .media import MediaPipeline
 from .state import BridgeState, StateStore, clear_pairing, issue_pair_code, pair_chat
-from .util import chunk_text
+from .util import chunk_text, normalize_telegram_slash_command
 
 
 logger = logging.getLogger(__name__)
+TELEDEX_COMMANDS = [
+    BotCommand("help", "Show teledex help"),
+    BotCommand("bridge_status", "Show teledex daemon and session status"),
+    BotCommand("start_session", "Ensure the Codex session is ready"),
+    BotCommand("interrupt", "Interrupt the current Codex request"),
+    BotCommand("reset", "Reset the current Codex thread"),
+]
+
+CODEX_COMMANDS = [
+    BotCommand("permissions", "Set what Codex can do without asking first"),
+    BotCommand("sandbox_add_read_dir", "Grant extra sandbox read access"),
+    BotCommand("agent", "Switch the active agent thread"),
+    BotCommand("apps", "Browse apps and insert them into your prompt"),
+    BotCommand("clear", "Clear the terminal and start a fresh chat"),
+    BotCommand("compact", "Summarize the visible conversation"),
+    BotCommand("copy", "Copy the latest completed Codex output"),
+    BotCommand("diff", "Show the current Git diff"),
+    BotCommand("exit", "Exit the Codex CLI"),
+    BotCommand("experimental", "Toggle experimental features"),
+    BotCommand("feedback", "Send logs to the Codex maintainers"),
+    BotCommand("init", "Generate an AGENTS.md scaffold"),
+    BotCommand("logout", "Sign out of Codex"),
+    BotCommand("mcp", "List configured MCP tools"),
+    BotCommand("mention", "Attach a file to the conversation"),
+    BotCommand("model", "Choose the active model"),
+    BotCommand("plan", "Switch to plan mode"),
+    BotCommand("personality", "Choose a communication style"),
+    BotCommand("ps", "Show background terminals and output"),
+    BotCommand("fork", "Fork the current conversation"),
+    BotCommand("resume", "Resume a saved conversation"),
+    BotCommand("new", "Start a new conversation"),
+    BotCommand("quit", "Exit the Codex CLI"),
+    BotCommand("review", "Ask Codex to review your working tree"),
+    BotCommand("status", "Display session configuration and token usage"),
+    BotCommand("debug_config", "Print config and requirements diagnostics"),
+    BotCommand("statusline", "Configure TUI status-line fields"),
+]
+
+TELEGRAM_COMMANDS = TELEDEX_COMMANDS + CODEX_COMMANDS
 
 
 @dataclass(slots=True)
@@ -79,6 +118,7 @@ class TelegramBridge:
             print("Send this code to the Telegram bot from your private chat.")
         await self.session.start()
         await self.application.initialize()
+        await self.application.bot.set_my_commands(TELEGRAM_COMMANDS)
         await self.application.start()
         await self.application.updater.start_polling(poll_interval=self.settings.poll_interval_seconds)
         logger.info("Telegram bridge started")
@@ -93,7 +133,7 @@ class TelegramBridge:
 
     def _wire_handlers(self) -> None:
         self.application.add_handler(CommandHandler("help", self._handle_help))
-        self.application.add_handler(CommandHandler("status", self._handle_status))
+        self.application.add_handler(CommandHandler("bridge_status", self._handle_status))
         self.application.add_handler(CommandHandler("start_session", self._handle_start_session))
         self.application.add_handler(CommandHandler("interrupt", self._handle_interrupt))
         self.application.add_handler(CommandHandler("reset", self._handle_reset))
@@ -101,6 +141,7 @@ class TelegramBridge:
         self.application.add_handler(MessageHandler(filters.PHOTO, self._handle_photo))
         self.application.add_handler(MessageHandler(filters.VOICE, self._handle_voice))
         self.application.add_handler(MessageHandler(filters.Document.IMAGE, self._handle_image_document))
+        self.application.add_handler(MessageHandler(filters.COMMAND, self._handle_codex_command))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
         self.application.add_error_handler(self._handle_error)
 
@@ -181,7 +222,9 @@ class TelegramBridge:
             return
         await self._safe_reply(
             update.effective_message,
-            "/help /status /start_session /interrupt /reset\n"
+            "/help /bridge_status /start_session /interrupt /reset\n"
+            "Telegram slash suggestions include the built-in Codex commands.\n"
+            "Codex-native commands such as /status, /model, /review, /plan, /resume and /quit are passed through to Codex.\n"
             "Send plain text to Codex.\n"
             "Send an image to pass a local file path to Codex.\n"
             "Send a voice message to transcribe and forward to Codex.",
@@ -234,6 +277,18 @@ class TelegramBridge:
             await self._safe_reply(message, "Custom reply forwarded.")
             return
         await self._run_with_typing(message.chat_id, self.session.send_text(message.text or ""))
+
+    async def _handle_codex_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        if message is None or not message.text:
+            return
+        if not self.state.pairing.is_paired():
+            await self._ensure_paired(message)
+            return
+        if not self._authorized(update):
+            return
+        command_text = normalize_telegram_slash_command(message.text)
+        await self._run_with_typing(message.chat_id, self.session.send_text(command_text))
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query

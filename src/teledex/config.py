@@ -12,6 +12,8 @@ DEFAULT_CONFIG_FILE = Path("~/.teledex/config.json").expanduser().resolve()
 DEFAULT_MEMORY_FILE = Path("~/.teledex/Memory.md").expanduser().resolve()
 DEFAULT_STATE_FILE = Path("~/.teledex/state.json").expanduser().resolve()
 DEFAULT_SESSION_STORAGE_DIR = Path("~/.teledex/sessions").expanduser().resolve()
+DEFAULT_PID_FILE = Path("~/.teledex/teledex.pid").expanduser().resolve()
+DEFAULT_LOG_FILE = Path("~/.teledex/teledex.log").expanduser().resolve()
 
 
 @dataclass(slots=True)
@@ -22,6 +24,8 @@ class Settings:
     memory_file: Path
     state_file: Path
     session_storage_dir: Path
+    pid_file: Path
+    log_file: Path
     pair_code_ttl_seconds: int
     pair_code_length: int
     pair_max_attempts: int
@@ -40,6 +44,8 @@ class Settings:
             memory_file=DEFAULT_MEMORY_FILE,
             state_file=DEFAULT_STATE_FILE,
             session_storage_dir=DEFAULT_SESSION_STORAGE_DIR,
+            pid_file=DEFAULT_PID_FILE,
+            log_file=DEFAULT_LOG_FILE,
             pair_code_ttl_seconds=600,
             pair_code_length=6,
             pair_max_attempts=5,
@@ -64,6 +70,8 @@ class Settings:
             memory_file=Path(merged["memory_file"]).expanduser().resolve(),
             state_file=Path(merged["state_file"]).expanduser().resolve(),
             session_storage_dir=Path(merged["session_storage_dir"]).expanduser().resolve(),
+            pid_file=Path(merged["pid_file"]).expanduser().resolve(),
+            log_file=Path(merged["log_file"]).expanduser().resolve(),
             pair_code_ttl_seconds=int(merged["pair_code_ttl_seconds"]),
             pair_code_length=int(merged["pair_code_length"]),
             pair_max_attempts=int(merged["pair_max_attempts"]),
@@ -80,11 +88,15 @@ class Settings:
         payload["memory_file"] = str(self.memory_file)
         payload["state_file"] = str(self.state_file)
         payload["session_storage_dir"] = str(self.session_storage_dir)
+        payload["pid_file"] = str(self.pid_file)
+        payload["log_file"] = str(self.log_file)
         return payload
 
     def ensure_directories(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.session_storage_dir.mkdir(parents=True, exist_ok=True)
+        self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
 
     def configure_logging(self) -> None:
         logging.basicConfig(
@@ -156,6 +168,8 @@ def run_setup_wizard(config_path: Path = DEFAULT_CONFIG_FILE, existing: Settings
     session_storage_dir = Path(
         _prompt_text("Session storage directory", str(current.session_storage_dir))
     ).expanduser().resolve()
+    pid_file = Path(_prompt_text("PID file", str(current.pid_file))).expanduser().resolve()
+    log_file = Path(_prompt_text("Log file", str(current.log_file))).expanduser().resolve()
     transcriber_backend = _prompt_choice(
         "Voice transcription backend",
         ["faster-whisper", "disabled"],
@@ -169,6 +183,8 @@ def run_setup_wizard(config_path: Path = DEFAULT_CONFIG_FILE, existing: Settings
         memory_file=memory_file,
         state_file=state_file,
         session_storage_dir=session_storage_dir,
+        pid_file=pid_file,
+        log_file=log_file,
         pair_code_ttl_seconds=current.pair_code_ttl_seconds,
         pair_code_length=current.pair_code_length,
         pair_max_attempts=current.pair_max_attempts,
