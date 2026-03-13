@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "teledex-cli"
-version = "0.2.0"
-description = "Bridge a local Codex CLI session to Telegram on macOS."
+version = "0.3.0"
+description = "Bridge local Codex or OpenCode CLI sessions to Telegram on macOS with multi-bot support."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
