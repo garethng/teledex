@@ -160,6 +160,38 @@ teledex unpair
 - Voice transcription is optional; if disabled, voice files are still saved locally but not
   transcribed.
 
+## Publishing
+
+PyPI publishing is handled by the GitHub Actions workflow at
+[` .github/workflows/publish-pypi.yml `](.github/workflows/publish-pypi.yml).
+
+Before the first release, configure PyPI Trusted Publishing so this repository is allowed to publish
+without a long-lived API token.
+
+Release process:
+
+1. Update the version in `pyproject.toml`.
+2. Commit the version change to `main`.
+3. Create a Git tag that matches the package version with a `v` prefix, for example `v0.1.0`.
+4. Push the tag and create a GitHub Release from that tag.
+5. When the GitHub Release is published, the workflow builds the package and uploads it to PyPI.
+
+Versioning convention:
+
+- `pyproject.toml` uses the canonical package version, for example `0.1.0`.
+- Git tags use the same version with a leading `v`, for example `v0.1.0`.
+- The GitHub Release tag and `pyproject.toml` version should always match apart from that `v`
+  prefix.
+
+Example:
+
+```text
+pyproject.toml -> version = "0.1.0"
+git tag        -> v0.1.0
+GitHub Release -> v0.1.0
+PyPI release   -> 0.1.0
+```
+
 ## Development
 
 Run tests:
