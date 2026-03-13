@@ -37,16 +37,38 @@ This avoids TUI rendering issues and keeps the conversation state inside a Codex
 
 ## Install
 
+Install from PyPI:
+
+```bash
+pip install teledex
+```
+
+```bash
+uv tool install teledex
+```
+
+Install from local source for development:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
 ```
 
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e '.[dev]'
+```
+
 Optional voice transcription support:
 
 ```bash
 pip install -e .[faster-whisper]
+```
+
+```bash
+uv pip install -e '.[faster-whisper]'
 ```
 
 ## First-Time Setup
