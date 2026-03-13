@@ -7,6 +7,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction
@@ -22,20 +23,24 @@ from telegram.error import NetworkError, TelegramError
 from telegram.request import HTTPXRequest
 
 from .codex_session import CodexSession
-from .config import Settings
+from .config import BotConfig, Settings
 from .interactions import InteractionPrompt
 from .media import MediaPipeline
-from .state import BridgeState, StateStore, clear_pairing, issue_pair_code, pair_chat
+from .opencode_session import OpencodeSession
+from .state import BridgeState, StateStore, clear_pairing, issue_pair_code, pair_chat, unpair_user
 from .util import chunk_text, normalize_telegram_slash_command
 
 
 logger = logging.getLogger(__name__)
+
+# Commands registered for every bot regardless of agent type
 TELEDEX_COMMANDS = [
     BotCommand("help", "Show teledex help"),
     BotCommand("bridge_status", "Show teledex daemon and session status"),
-    BotCommand("start_session", "Ensure the Codex session is ready"),
-    BotCommand("interrupt", "Interrupt the current Codex request"),
-    BotCommand("reset", "Reset the current Codex thread"),
+    BotCommand("start_session", "Ensure the agent session is ready"),
+    BotCommand("interrupt", "Interrupt the current agent request"),
+    BotCommand("reset", "Reset the current agent thread"),
+    BotCommand("unpair_chat", "Remove this chat from authorized list"),
 ]
 
 CODEX_COMMANDS = [
@@ -45,13 +50,13 @@ CODEX_COMMANDS = [
     BotCommand("apps", "Browse apps and insert them into your prompt"),
     BotCommand("clear", "Clear the terminal and start a fresh chat"),
     BotCommand("compact", "Summarize the visible conversation"),
-    BotCommand("copy", "Copy the latest completed Codex output"),
+    BotCommand("copy", "Copy the latest completed output"),
     BotCommand("diff", "Show the current Git diff"),
-    BotCommand("exit", "Exit the Codex CLI"),
+    BotCommand("exit", "Exit the CLI"),
     BotCommand("experimental", "Toggle experimental features"),
-    BotCommand("feedback", "Send logs to the Codex maintainers"),
+    BotCommand("feedback", "Send logs to the maintainers"),
     BotCommand("init", "Generate an AGENTS.md scaffold"),
-    BotCommand("logout", "Sign out of Codex"),
+    BotCommand("logout", "Sign out"),
     BotCommand("mcp", "List configured MCP tools"),
     BotCommand("mention", "Attach a file to the conversation"),
     BotCommand("model", "Choose the active model"),
@@ -61,14 +66,24 @@ CODEX_COMMANDS = [
     BotCommand("fork", "Fork the current conversation"),
     BotCommand("resume", "Resume a saved conversation"),
     BotCommand("new", "Start a new conversation"),
-    BotCommand("quit", "Exit the Codex CLI"),
-    BotCommand("review", "Ask Codex to review your working tree"),
+    BotCommand("quit", "Exit the CLI"),
+    BotCommand("review", "Ask the agent to review your working tree"),
     BotCommand("status", "Display session configuration and token usage"),
     BotCommand("debug_config", "Print config and requirements diagnostics"),
     BotCommand("statusline", "Configure TUI status-line fields"),
 ]
 
-TELEGRAM_COMMANDS = TELEDEX_COMMANDS + CODEX_COMMANDS
+OPENCODE_COMMANDS = [
+    BotCommand("model", "Choose the active model"),
+    BotCommand("new", "Start a new conversation"),
+    BotCommand("resume", "Resume a saved conversation"),
+    BotCommand("logout", "Sign out"),
+    BotCommand("status", "Display session configuration"),
+    BotCommand("mcp", "List configured MCP tools"),
+]
+
+
+AgentSession = Union[CodexSession, OpencodeSession]
 
 
 @dataclass(slots=True)
@@ -77,26 +92,59 @@ class PendingFreeformReply:
     prompt: str
 
 
-class TelegramBridge:
-    def __init__(self, settings: Settings, store: StateStore, state: BridgeState):
-        self.settings = settings
+def _make_session(bot_cfg: BotConfig, on_text, on_interaction) -> AgentSession:
+    """Factory: create the right session type based on agent_type."""
+    if bot_cfg.agent_type == "opencode":
+        return OpencodeSession(
+            opencode_cmd=bot_cfg.agent_cmd,
+            root_dir=bot_cfg.session_storage_dir,
+            workspace_root=bot_cfg.workspace_root,
+            memory_file=bot_cfg.memory_file,
+            on_text=on_text,
+            on_interaction=on_interaction,
+            model=bot_cfg.model,
+        )
+    return CodexSession(
+        codex_cmd=bot_cfg.agent_cmd,
+        root_dir=bot_cfg.session_storage_dir,
+        workspace_root=bot_cfg.workspace_root,
+        memory_file=bot_cfg.memory_file,
+        on_text=on_text,
+        on_interaction=on_interaction,
+    )
+
+
+class BotInstance:
+    """A single Telegram bot connected to one agent session (codex or opencode)."""
+
+    def __init__(self, bot_cfg: BotConfig, global_settings: Settings, store: StateStore, state: BridgeState):
+        self.bot_cfg = bot_cfg
+        self.global_settings = global_settings
         self.store = store
         self.state = state
         self.pending_freeform: PendingFreeformReply | None = None
         self.typing_task: asyncio.Task | None = None
-        self.session = CodexSession(
-            codex_cmd=settings.codex_cmd,
-            root_dir=settings.session_storage_dir,
-            workspace_root=settings.workspace_root,
-            memory_file=settings.memory_file,
-            on_text=self._send_codex_text,
+        # Track which chat triggered the current agent request (for replies)
+        self.current_chat_id: int | None = None
+        # Cache bot username for mention detection
+        self.bot_username: str | None = None
+
+        # Configure per-bot logging
+        self._setup_logging()
+
+        self.session: AgentSession = _make_session(
+            bot_cfg,
+            on_text=self._send_agent_text,
             on_interaction=self._send_interaction,
         )
-        self.media = MediaPipeline(settings.transcriber_backend, settings.whisper_model)
+        self.media = MediaPipeline(
+            global_settings.transcriber_backend,
+            global_settings.whisper_model,
+        )
         request = HTTPXRequest(httpx_kwargs={"trust_env": False})
         self.application = (
             Application.builder()
-            .token(settings.telegram_bot_token)
+            .token(bot_cfg.telegram_bot_token)
             .request(request)
             .get_updates_request(request)
             .concurrent_updates(False)
@@ -104,24 +152,48 @@ class TelegramBridge:
         )
         self._wire_handlers()
 
+    def _setup_logging(self) -> None:
+        """Add a file handler for this bot's log file."""
+        bot_cfg = self.bot_cfg
+        bot_cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(bot_cfg.log_file, encoding="utf-8")
+        formatter = logging.Formatter(
+            f"%(asctime)s [{bot_cfg.name}] %(levelname)s %(name)s: %(message)s"
+        )
+        handler.setFormatter(formatter)
+        # Add handler to root logger so all modules' logs go to bot's file
+        logging.getLogger().addHandler(handler)
+
+    def _commands(self) -> list[BotCommand]:
+        if self.bot_cfg.agent_type == "opencode":
+            return TELEDEX_COMMANDS + OPENCODE_COMMANDS
+        return TELEDEX_COMMANDS + CODEX_COMMANDS
+
     async def run(self) -> None:
-        if not shutil.which(self.settings.codex_cmd):
-            raise RuntimeError(f"Codex command not found: {self.settings.codex_cmd}")
+        if not shutil.which(self.bot_cfg.agent_cmd):
+            raise RuntimeError(
+                f"Agent command not found for bot '{self.bot_cfg.name}': {self.bot_cfg.agent_cmd}"
+            )
         if not self.state.pairing.is_paired() and not self.state.pairing.code_valid():
             code = issue_pair_code(
                 self.state,
-                self.settings.pair_code_length,
-                self.settings.pair_code_ttl_seconds,
+                self.global_settings.pair_code_length,
+                self.global_settings.pair_code_ttl_seconds,
             )
             self.store.save(self.state)
-            print(f"Pairing code: {code}")
-            print("Send this code to the Telegram bot from your private chat.")
+            print(f"[{self.bot_cfg.name}] Pairing code: {code}")
+            print(f"[{self.bot_cfg.name}] Send this code to the Telegram bot from your private chat.")
         await self.session.start()
         await self.application.initialize()
-        await self.application.bot.set_my_commands(TELEGRAM_COMMANDS)
+        me = await self.application.bot.get_me()
+        self.bot_username = me.username
+        await self.application.bot.set_my_commands(self._commands())
         await self.application.start()
-        await self.application.updater.start_polling(poll_interval=self.settings.poll_interval_seconds)
-        logger.info("Telegram bridge started")
+        assert self.application.updater is not None
+        await self.application.updater.start_polling(
+            poll_interval=self.global_settings.poll_interval_seconds
+        )
+        logger.info("Bot '%s' (%s) started", self.bot_cfg.name, self.bot_cfg.agent_type)
         try:
             while True:
                 await asyncio.sleep(3600)
@@ -137,23 +209,29 @@ class TelegramBridge:
         self.application.add_handler(CommandHandler("start_session", self._handle_start_session))
         self.application.add_handler(CommandHandler("interrupt", self._handle_interrupt))
         self.application.add_handler(CommandHandler("reset", self._handle_reset))
+        self.application.add_handler(CommandHandler("unpair_chat", self._handle_unpair_chat))
+        if self.bot_cfg.agent_type == "opencode":
+            self.application.add_handler(CommandHandler("model", self._handle_model))
         self.application.add_handler(CallbackQueryHandler(self._handle_callback))
         self.application.add_handler(MessageHandler(filters.PHOTO, self._handle_photo))
         self.application.add_handler(MessageHandler(filters.VOICE, self._handle_voice))
         self.application.add_handler(MessageHandler(filters.Document.IMAGE, self._handle_image_document))
-        self.application.add_handler(MessageHandler(filters.COMMAND, self._handle_codex_command))
+        self.application.add_handler(MessageHandler(filters.COMMAND, self._handle_agent_command))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
         self.application.add_error_handler(self._handle_error)
 
     def _authorized(self, update: Update) -> bool:
-        message = update.effective_message
-        chat_id = message.chat_id if message else (update.effective_chat.id if update.effective_chat else None)
-        return bool(chat_id and self.state.pairing.authorized_chat_id == chat_id)
+        """Check if the user who sent this update is authorized.
+        
+        Works in both private chats and groups — only checks user_id.
+        """
+        user = update.effective_user
+        if user is None:
+            return False
+        return self.state.pairing.is_authorized(user.id)
 
-    async def _send_to_authorized_chat(self, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
-        chat_id = self.state.pairing.authorized_chat_id
-        if chat_id is None:
-            return
+    async def _send_to_chat(self, chat_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+        """Send message to a specific chat (private or group)."""
         for chunk in chunk_text(text):
             try:
                 await self.application.bot.send_message(
@@ -162,17 +240,23 @@ class TelegramBridge:
                     reply_markup=reply_markup,
                 )
             except NetworkError as exc:
-                logger.error("Telegram network error while sending message: %s", exc)
+                logger.error("[%s] Telegram network error: %s", self.bot_cfg.name, exc)
                 return
             except TelegramError as exc:
-                logger.error("Telegram API error while sending message: %s", exc)
+                logger.error("[%s] Telegram API error: %s", self.bot_cfg.name, exc)
                 return
             reply_markup = None
 
-    async def _send_codex_text(self, text: str) -> None:
-        await self._send_to_authorized_chat(text)
+    async def _send_agent_text(self, text: str) -> None:
+        """Callback from agent session — reply to the chat that triggered the request."""
+        if self.current_chat_id is None:
+            return
+        await self._send_to_chat(self.current_chat_id, text)
 
     async def _send_interaction(self, interaction: InteractionPrompt, raw_text: str) -> None:
+        """Callback from agent session — send interaction prompt to triggering chat."""
+        if self.current_chat_id is None:
+            return
         buttons = [
             [InlineKeyboardButton(option.label[:64], callback_data=f"choice:{option.id}")]
             for option in interaction.options
@@ -180,7 +264,7 @@ class TelegramBridge:
         if interaction.allow_custom:
             buttons.append([InlineKeyboardButton("Custom Reply", callback_data="choice:custom")])
         markup = InlineKeyboardMarkup(buttons)
-        await self._send_to_authorized_chat(raw_text, reply_markup=markup)
+        await self._send_to_chat(self.current_chat_id, raw_text, reply_markup=markup)
 
     def _option_by_id(self, option_id: str) -> str | None:
         interaction = self.session.pending_interaction
@@ -192,20 +276,40 @@ class TelegramBridge:
         return None
 
     async def _ensure_paired(self, message: Message) -> bool:
-        if self.state.pairing.is_paired():
-            if self.state.pairing.authorized_chat_id == message.chat_id:
-                return True
+        """Handle pairing via private chat only.
+        
+        Must be called from a private chat. Pairs the user (not the chat),
+        so after pairing in private chat, the user can use bot in groups.
+        """
+        # Always reload from disk so that codes issued by `teledex pair`
+        # after the daemon started are visible to the running process.
+        self.state = self.store.load()
+        
+        # Private chat: message.chat.id == message.from_user.id
+        # Group chat: message.chat.id != message.from_user.id
+        from_user = message.from_user
+        if from_user is None:
             return False
+        
+        # Only allow pairing in private chats
+        if message.chat.type != "private":
+            await self._safe_reply(message, "Pairing must be done in a private chat with the bot.")
+            return False
+        
+        user_id = from_user.id
+        if self.state.pairing.is_authorized(user_id):
+            return True
+        
         success, status = pair_chat(
             self.state,
             message.text or "",
-            message.chat_id,
-            self.settings.pair_max_attempts,
-            self.settings.pair_cooldown_seconds,
+            user_id,
+            self.global_settings.pair_max_attempts,
+            self.global_settings.pair_cooldown_seconds,
         )
         self.store.save(self.state)
         if success:
-            await self._safe_reply(message, "Pairing complete. This chat is now authorized.")
+            await self._safe_reply(message, "Pairing complete. You can now use this bot in private chats and groups.")
             return True
         if status == "cooldown":
             await self._safe_reply(message, "Pairing is temporarily locked. Try again later.")
@@ -214,20 +318,23 @@ class TelegramBridge:
         elif status == "invalid":
             await self._safe_reply(message, "Invalid pairing code.")
         else:
-            await self._safe_reply(message, "Bridge is already paired with another chat.")
+            await self._safe_reply(message, "You are not authorized. Send the pairing code in a private chat.")
         return False
 
     async def _handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
+        agent_label = self.bot_cfg.agent_type.capitalize()
         await self._safe_reply(
             update.effective_message,
-            "/help /bridge_status /start_session /interrupt /reset\n"
-            "Telegram slash suggestions include the built-in Codex commands.\n"
-            "Codex-native commands such as /status, /model, /review, /plan, /resume and /quit are passed through to Codex.\n"
-            "Send plain text to Codex.\n"
-            "Send an image to pass a local file path to Codex.\n"
-            "Send a voice message to transcribe and forward to Codex.",
+            f"Bot: {self.bot_cfg.name} ({agent_label})\n\n"
+            "Commands:\n"
+            "/help /bridge_status /start_session /interrupt /reset /unpair_chat\n\n"
+            f"{agent_label} slash commands are passed through to the agent.\n"
+            "Send plain text to the agent.\n"
+            "Send an image to pass a local file path to the agent.\n"
+            "Send a voice message to transcribe and forward to the agent.\n\n"
+            "Note: After pairing in a private chat, you can use this bot in any Telegram group.",
         )
 
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,31 +342,76 @@ class TelegramBridge:
             return
         status = self.session.status()
         pending = status.pending_interaction.kind if status.pending_interaction else "none"
+        users = ", ".join(str(uid) for uid in self.state.pairing.authorized_user_ids) or "(none)"
         await self._safe_reply(
             update.effective_message,
-            f"paired: yes\nstate: {status.state}\npid: {status.pid}\nsession_dir: {status.session_dir}\n"
+            f"bot: {self.bot_cfg.name}\n"
+            f"agent: {self.bot_cfg.agent_type}\n"
+            f"authorized_users: {users}\n"
+            f"state: {status.state}\npid: {status.pid}\n"
+            f"session_dir: {status.session_dir}\n"
             f"pending_interaction: {pending}\nlast_output_at: {status.last_output_at}\n"
-            f"memory_file: {self.settings.memory_file}",
+            f"memory_file: {self.bot_cfg.memory_file}",
         )
 
     async def _handle_start_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
         await self.session.start()
-        await self._safe_reply(update.effective_message, "Codex session is ready.")
+        await self._safe_reply(update.effective_message, f"{self.bot_cfg.agent_type.capitalize()} session is ready.")
 
     async def _handle_interrupt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
         await self.session.interrupt()
-        await self._safe_reply(update.effective_message, "Sent interrupt to Codex.")
+        await self._safe_reply(update.effective_message, f"Sent interrupt to {self.bot_cfg.agent_type}.")
 
     async def _handle_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
         self.pending_freeform = None
         await self.session.reset()
-        await self._safe_reply(update.effective_message, "Codex session reset.")
+        await self._safe_reply(update.effective_message, f"{self.bot_cfg.agent_type.capitalize()} session reset.")
+
+    async def _handle_unpair_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Remove the current user from authorized list."""
+        if not self._authorized(update):
+            return
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        removed = unpair_user(self.state, user.id)
+        self.store.save(self.state)
+        if removed:
+            await self._safe_reply(message, f"You have been removed from authorized users. You will no longer be able to use this bot.")
+        else:
+            await self._safe_reply(message, "You were not in the authorized list.")
+
+    async def _handle_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/model [provider/model] — show or set the active model (opencode bots only).
+
+        Usage:
+          /model                         — show current model
+          /model openrouter/openai/gpt-5.4   — switch model (takes effect on next message)
+          /model reset                   — revert to opencode default
+        """
+        if not self._authorized(update):
+            return
+        assert isinstance(self.session, OpencodeSession)
+        message = update.effective_message
+        args = (context.args or [])
+        if not args:
+            current = self.session.model or "(opencode default)"
+            await self._safe_reply(message, f"Current model: {current}\nUsage: /model provider/model")
+            return
+        target = args[0].strip()
+        if target.lower() == "reset":
+            self.session.model = None
+            await self._safe_reply(message, "Model reset to opencode default.")
+        else:
+            self.session.model = target
+            await self._safe_reply(message, f"Model set to: {target}\n(takes effect on next message)")
 
     async def _handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -270,23 +422,48 @@ class TelegramBridge:
             return
         if not self._authorized(update):
             return
+        # In groups, only respond if bot is mentioned or replied to
+        text_to_send = message.text or ""
+        if message.chat.type in ("group", "supergroup"):
+            bot_mentioned = False
+            # Check if message is a reply to bot
+            if message.reply_to_message and message.reply_to_message.from_user:
+                if message.reply_to_message.from_user.id == self.application.bot.id:
+                    bot_mentioned = True
+            # Check if bot is mentioned in entities
+            if not bot_mentioned and message.entities and self.bot_username:
+                for entity in message.entities:
+                    if entity.type == "mention" and message.text:
+                        mention_text = message.text[entity.offset:entity.offset + entity.length]
+                        if mention_text.lstrip("@") == self.bot_username:
+                            bot_mentioned = True
+                            # Remove @mention from text sent to agent
+                            text_to_send = text_to_send.replace(mention_text, "").strip()
+                    elif entity.type == "text_mention":
+                        if entity.user and entity.user.id == self.application.bot.id:
+                            bot_mentioned = True
+            if not bot_mentioned:
+                return
+        
+        self.current_chat_id = message.chat_id
         if self.pending_freeform:
-            await self._run_with_typing(message.chat_id, self.session.send_text(message.text or ""))
+            await self._run_with_typing(message.chat_id, self.session.send_text(text_to_send))
             self.session.pending_interaction = None
             self.pending_freeform = None
             await self._safe_reply(message, "Custom reply forwarded.")
             return
-        await self._run_with_typing(message.chat_id, self.session.send_text(message.text or ""))
+        await self._run_with_typing(message.chat_id, self.session.send_text(text_to_send))
 
-    async def _handle_codex_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_agent_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         if message is None or not message.text:
             return
         if not self.state.pairing.is_paired():
-            await self._ensure_paired(message)
+            await self._safe_reply(message, "Not paired. Send the pairing code as a plain text message.")
             return
         if not self._authorized(update):
             return
+        self.current_chat_id = message.chat_id
         command_text = normalize_telegram_slash_command(message.text)
         await self._run_with_typing(message.chat_id, self.session.send_text(command_text))
 
@@ -306,17 +483,25 @@ class TelegramBridge:
                 interaction_kind=self.session.pending_interaction.kind,
                 prompt=self.session.pending_interaction.prompt,
             )
-            await self._safe_reply(query.message, "Send the next text message as your custom reply.")
+            query_message = query.message
+            if query_message and hasattr(query_message, "reply_text"):
+                await self._safe_reply(query_message, "Send the next text message as your custom reply.")  # type: ignore[arg-type]
             return
         value = self._option_by_id(choice)
         if not value:
-            await self._safe_reply(query.message, "That option is no longer available.")
+            query_message = query.message
+            if query_message and hasattr(query_message, "reply_text"):
+                await self._safe_reply(query_message, "That option is no longer available.")  # type: ignore[arg-type]
             return
-        chat_id = query.message.chat_id if query.message else None
+        query_message = query.message
+        chat_id = getattr(query_message, "chat_id", None) if query_message else None
+        if chat_id:
+            self.current_chat_id = chat_id
         await self._run_with_typing(chat_id, self.session.send_text(value))
         self.session.pending_interaction = None
         self.pending_freeform = None
-        await self._safe_reply(query.message, f"Selected: {value}")
+        if query_message and hasattr(query_message, "reply_text"):
+            await self._safe_reply(query_message, f"Selected: {value}")  # type: ignore[arg-type]
 
     async def _handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
@@ -324,12 +509,14 @@ class TelegramBridge:
         message = update.effective_message
         if message is None or not message.photo:
             return
+        self.current_chat_id = message.chat_id
         photo = message.photo[-1]
         tg_file = await photo.get_file()
         session_dir = self.session.status().session_dir
         if session_dir is None:
             await self.session.start()
             session_dir = self.session.status().session_dir
+        assert session_dir is not None
         target = Path(session_dir) / "media" / f"photo-{int(time.time())}.jpg"
         path = await self.media.save_telegram_file(tg_file, target)
         prompt = f"User uploaded an image.\nLocal file path: {path}\nCaption: {message.caption or '(none)'}"
@@ -342,11 +529,13 @@ class TelegramBridge:
         message = update.effective_message
         if message is None or message.document is None:
             return
+        self.current_chat_id = message.chat_id
         tg_file = await message.document.get_file()
         session_dir = self.session.status().session_dir
         if session_dir is None:
             await self.session.start()
             session_dir = self.session.status().session_dir
+        assert session_dir is not None
         filename = message.document.file_name or f"image-{int(time.time())}"
         target = Path(session_dir) / "media" / filename
         path = await self.media.save_telegram_file(tg_file, target)
@@ -360,11 +549,13 @@ class TelegramBridge:
         message = update.effective_message
         if message is None or message.voice is None:
             return
+        self.current_chat_id = message.chat_id
         tg_file = await message.voice.get_file()
         session_dir = self.session.status().session_dir
         if session_dir is None:
             await self.session.start()
             session_dir = self.session.status().session_dir
+        assert session_dir is not None
         target = Path(session_dir) / "media" / f"voice-{int(time.time())}.ogg"
         path = await self.media.save_telegram_file(tg_file, target)
         try:
@@ -373,7 +564,7 @@ class TelegramBridge:
             await self._run_with_typing(message.chat_id, self.session.send_text(payload))
             await self._safe_reply(message, "Voice transcribed and forwarded.")
         except Exception as exc:
-            logger.exception("Voice transcription failed")
+            logger.exception("[%s] Voice transcription failed", self.bot_cfg.name)
             await self._safe_reply(message, f"Voice saved but transcription failed: {exc}")
 
     async def unpair(self) -> None:
@@ -386,18 +577,18 @@ class TelegramBridge:
         try:
             await message.reply_text(text)
         except NetworkError as exc:
-            logger.error("Telegram network error while replying: %s", exc)
+            logger.error("[%s] Telegram network error while replying: %s", self.bot_cfg.name, exc)
         except TelegramError as exc:
-            logger.error("Telegram API error while replying: %s", exc)
+            logger.error("[%s] Telegram API error while replying: %s", self.bot_cfg.name, exc)
 
     async def _handle_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.exception("Unhandled telegram application error", exc_info=context.error)
+        logger.exception("[%s] Unhandled telegram application error", self.bot_cfg.name, exc_info=context.error)
 
     async def _run_with_typing(self, chat_id: int | None, operation) -> None:
         if chat_id is None:
             await operation
             return
-        self._stop_typing()
+        self._stop_typing_sync()
         self.typing_task = asyncio.create_task(self._typing_loop(chat_id))
         try:
             await operation
@@ -412,9 +603,14 @@ class TelegramBridge:
         except asyncio.CancelledError:
             raise
         except NetworkError as exc:
-            logger.error("Telegram network error while sending typing action: %s", exc)
+            logger.error("[%s] Network error during typing: %s", self.bot_cfg.name, exc)
         except TelegramError as exc:
-            logger.error("Telegram API error while sending typing action: %s", exc)
+            logger.error("[%s] Telegram error during typing: %s", self.bot_cfg.name, exc)
+
+    def _stop_typing_sync(self) -> None:
+        if self.typing_task is not None:
+            self.typing_task.cancel()
+            self.typing_task = None
 
     async def _stop_typing(self) -> None:
         if self.typing_task is None:
@@ -423,3 +619,58 @@ class TelegramBridge:
         with contextlib.suppress(asyncio.CancelledError):
             await self.typing_task
         self.typing_task = None
+
+
+class MultiAgentRunner:
+    """Runs all configured bots concurrently in a single asyncio event loop."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.instances: list[BotInstance] = []
+        for bot_cfg in settings.bots:
+            store = StateStore(bot_cfg.state_file)
+            state = store.load()
+            self.instances.append(BotInstance(
+                bot_cfg=bot_cfg,
+                global_settings=settings,
+                store=store,
+                state=state,
+            ))
+
+    async def run(self) -> None:
+        if not self.instances:
+            raise RuntimeError("No bots configured. Add at least one bot to config.json.")
+        tasks = [asyncio.create_task(inst.run(), name=inst.bot_cfg.name) for inst in self.instances]
+        logger.info("Starting %d bot(s)", len(tasks))
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                task.cancel()
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat alias: TelegramBridge wraps a single BotInstance
+# ---------------------------------------------------------------------------
+
+class TelegramBridge:
+    """Backward-compatible wrapper: single bot, single agent session.
+
+    Accepts the legacy (settings, store, state) signature so existing code
+    in cli.py that builds TelegramBridge directly continues to work.
+    """
+
+    def __init__(self, settings: Settings, store: StateStore, state: BridgeState):
+        if not settings.bots:
+            raise ValueError("No bots configured in settings")
+        bot_cfg = settings.bots[0]
+        self._instance = BotInstance(
+            bot_cfg=bot_cfg,
+            global_settings=settings,
+            store=store,
+            state=state,
+        )
+
+    async def run(self) -> None:
+        await self._instance.run()
