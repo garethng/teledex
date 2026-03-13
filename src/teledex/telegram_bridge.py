@@ -115,28 +115,30 @@ def _make_session(bot_cfg: BotConfig, on_text, on_interaction) -> AgentSession:
 
 
 class BotInstance:
-    """A single Telegram bot connected to one agent session (codex or opencode)."""
+    """A single Telegram bot with per-chat isolated agent sessions.
+    
+    Each chat (private or group) gets its own independent session with
+    isolated conversation history and context.
+    """
 
     def __init__(self, bot_cfg: BotConfig, global_settings: Settings, store: StateStore, state: BridgeState):
         self.bot_cfg = bot_cfg
         self.global_settings = global_settings
         self.store = store
         self.state = state
-        self.pending_freeform: PendingFreeformReply | None = None
-        self.typing_task: asyncio.Task | None = None
-        # Track which chat triggered the current agent request (for replies)
-        self.current_chat_id: int | None = None
+        
+        # Per-chat sessions: {chat_id: AgentSession}
+        self.sessions: dict[int, AgentSession] = {}
+        # Per-chat pending freeform replies
+        self.pending_freeforms: dict[int, PendingFreeformReply] = {}
+        # Per-chat typing tasks
+        self.typing_tasks: dict[int, asyncio.Task] = {}
         # Cache bot username for mention detection
         self.bot_username: str | None = None
 
         # Configure per-bot logging
         self._setup_logging()
 
-        self.session: AgentSession = _make_session(
-            bot_cfg,
-            on_text=self._send_agent_text,
-            on_interaction=self._send_interaction,
-        )
         self.media = MediaPipeline(
             global_settings.transcriber_backend,
             global_settings.whisper_model,
@@ -169,6 +171,46 @@ class BotInstance:
             return TELEDEX_COMMANDS + OPENCODE_COMMANDS
         return TELEDEX_COMMANDS + CODEX_COMMANDS
 
+    def _get_or_create_session(self, chat_id: int) -> AgentSession:
+        """Get existing session for this chat, or create a new isolated one."""
+        if chat_id in self.sessions:
+            return self.sessions[chat_id]
+        
+        # Create per-chat session directory: ~/.teledex/sessions/<botname>/<chat_id>/
+        session_root = self.bot_cfg.session_storage_dir / str(chat_id)
+        session_root.mkdir(parents=True, exist_ok=True)
+        
+        # Factory creates the session with chat-specific callbacks
+        def on_text(text: str):
+            return self._send_agent_text(chat_id, text)
+        
+        def on_interaction(interaction: InteractionPrompt, raw_text: str):
+            return self._send_interaction(chat_id, interaction, raw_text)
+        
+        if self.bot_cfg.agent_type == "opencode":
+            session = OpencodeSession(
+                opencode_cmd=self.bot_cfg.agent_cmd,
+                root_dir=session_root,
+                workspace_root=self.bot_cfg.workspace_root,
+                memory_file=self.bot_cfg.memory_file,
+                on_text=on_text,
+                on_interaction=on_interaction,
+                model=self.bot_cfg.model,
+            )
+        else:
+            session = CodexSession(
+                codex_cmd=self.bot_cfg.agent_cmd,
+                root_dir=session_root,
+                workspace_root=self.bot_cfg.workspace_root,
+                memory_file=self.bot_cfg.memory_file,
+                on_text=on_text,
+                on_interaction=on_interaction,
+            )
+        
+        self.sessions[chat_id] = session
+        logger.info("[%s] Created new session for chat %s", self.bot_cfg.name, chat_id)
+        return session
+
     async def run(self) -> None:
         if not shutil.which(self.bot_cfg.agent_cmd):
             raise RuntimeError(
@@ -183,7 +225,6 @@ class BotInstance:
             self.store.save(self.state)
             print(f"[{self.bot_cfg.name}] Pairing code: {code}")
             print(f"[{self.bot_cfg.name}] Send this code to the Telegram bot from your private chat.")
-        await self.session.start()
         await self.application.initialize()
         me = await self.application.bot.get_me()
         self.bot_username = me.username
@@ -201,7 +242,9 @@ class BotInstance:
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()
-            await self.session.stop()
+            # Stop all active sessions
+            for session in self.sessions.values():
+                await session.stop()
 
     def _wire_handlers(self) -> None:
         self.application.add_handler(CommandHandler("help", self._handle_help))
@@ -247,16 +290,12 @@ class BotInstance:
                 return
             reply_markup = None
 
-    async def _send_agent_text(self, text: str) -> None:
-        """Callback from agent session — reply to the chat that triggered the request."""
-        if self.current_chat_id is None:
-            return
-        await self._send_to_chat(self.current_chat_id, text)
+    async def _send_agent_text(self, chat_id: int, text: str) -> None:
+        """Callback from agent session — reply to the specific chat."""
+        await self._send_to_chat(chat_id, text)
 
-    async def _send_interaction(self, interaction: InteractionPrompt, raw_text: str) -> None:
-        """Callback from agent session — send interaction prompt to triggering chat."""
-        if self.current_chat_id is None:
-            return
+    async def _send_interaction(self, chat_id: int, interaction: InteractionPrompt, raw_text: str) -> None:
+        """Callback from agent session — send interaction prompt to specific chat."""
         buttons = [
             [InlineKeyboardButton(option.label[:64], callback_data=f"choice:{option.id}")]
             for option in interaction.options
@@ -264,10 +303,13 @@ class BotInstance:
         if interaction.allow_custom:
             buttons.append([InlineKeyboardButton("Custom Reply", callback_data="choice:custom")])
         markup = InlineKeyboardMarkup(buttons)
-        await self._send_to_chat(self.current_chat_id, raw_text, reply_markup=markup)
+        await self._send_to_chat(chat_id, raw_text, reply_markup=markup)
 
-    def _option_by_id(self, option_id: str) -> str | None:
-        interaction = self.session.pending_interaction
+    def _option_by_id(self, chat_id: int, option_id: str) -> str | None:
+        session = self.sessions.get(chat_id)
+        if not session:
+            return None
+        interaction = session.pending_interaction
         if not interaction:
             return None
         for option in interaction.options:
@@ -340,14 +382,20 @@ class BotInstance:
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
-        status = self.session.status()
+        message = update.effective_message
+        if message is None:
+            return
+        session = self._get_or_create_session(message.chat_id)
+        status = session.status()
         pending = status.pending_interaction.kind if status.pending_interaction else "none"
         users = ", ".join(str(uid) for uid in self.state.pairing.authorized_user_ids) or "(none)"
         await self._safe_reply(
-            update.effective_message,
+            message,
             f"bot: {self.bot_cfg.name}\n"
             f"agent: {self.bot_cfg.agent_type}\n"
+            f"chat_id: {message.chat_id}\n"
             f"authorized_users: {users}\n"
+            f"active_sessions: {len(self.sessions)}\n"
             f"state: {status.state}\npid: {status.pid}\n"
             f"session_dir: {status.session_dir}\n"
             f"pending_interaction: {pending}\nlast_output_at: {status.last_output_at}\n"
@@ -357,21 +405,39 @@ class BotInstance:
     async def _handle_start_session(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
-        await self.session.start()
-        await self._safe_reply(update.effective_message, f"{self.bot_cfg.agent_type.capitalize()} session is ready.")
+        message = update.effective_message
+        if message is None:
+            return
+        session = self._get_or_create_session(message.chat_id)
+        await session.start()
+        await self._safe_reply(message, f"{self.bot_cfg.agent_type.capitalize()} session is ready.")
 
     async def _handle_interrupt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
-        await self.session.interrupt()
-        await self._safe_reply(update.effective_message, f"Sent interrupt to {self.bot_cfg.agent_type}.")
+        message = update.effective_message
+        if message is None:
+            return
+        session = self.sessions.get(message.chat_id)
+        if session:
+            await session.interrupt()
+            await self._safe_reply(message, f"Sent interrupt to {self.bot_cfg.agent_type}.")
+        else:
+            await self._safe_reply(message, "No active session for this chat.")
 
     async def _handle_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
-        self.pending_freeform = None
-        await self.session.reset()
-        await self._safe_reply(update.effective_message, f"{self.bot_cfg.agent_type.capitalize()} session reset.")
+        message = update.effective_message
+        if message is None:
+            return
+        session = self.sessions.get(message.chat_id)
+        if session:
+            self.pending_freeforms.pop(message.chat_id, None)
+            await session.reset()
+            await self._safe_reply(message, f"{self.bot_cfg.agent_type.capitalize()} session reset.")
+        else:
+            await self._safe_reply(message, "No active session for this chat.")
 
     async def _handle_unpair_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Remove the current user from authorized list."""
@@ -393,24 +459,29 @@ class BotInstance:
 
         Usage:
           /model                         — show current model
-          /model openrouter/openai/gpt-5.4   — switch model (takes effect on next message)
+          /model openrouter/openai/gpt-5   — switch model (takes effect on next message)
           /model reset                   — revert to opencode default
         """
         if not self._authorized(update):
             return
-        assert isinstance(self.session, OpencodeSession)
         message = update.effective_message
+        if message is None:
+            return
+        session = self._get_or_create_session(message.chat_id)
+        if not isinstance(session, OpencodeSession):
+            await self._safe_reply(message, "This command is only available for opencode bots.")
+            return
         args = (context.args or [])
         if not args:
-            current = self.session.model or "(opencode default)"
+            current = session.model or "(opencode default)"
             await self._safe_reply(message, f"Current model: {current}\nUsage: /model provider/model")
             return
         target = args[0].strip()
         if target.lower() == "reset":
-            self.session.model = None
+            session.model = None
             await self._safe_reply(message, "Model reset to opencode default.")
         else:
-            self.session.model = target
+            session.model = target
             await self._safe_reply(message, f"Model set to: {target}\n(takes effect on next message)")
 
     async def _handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -445,14 +516,14 @@ class BotInstance:
             if not bot_mentioned:
                 return
         
-        self.current_chat_id = message.chat_id
-        if self.pending_freeform:
-            await self._run_with_typing(message.chat_id, self.session.send_text(text_to_send))
-            self.session.pending_interaction = None
-            self.pending_freeform = None
+        session = self._get_or_create_session(message.chat_id)
+        if self.pending_freeforms.get(message.chat_id):
+            await self._run_with_typing(message.chat_id, session.send_text(text_to_send))
+            session.pending_interaction = None
+            self.pending_freeforms.pop(message.chat_id, None)
             await self._safe_reply(message, "Custom reply forwarded.")
             return
-        await self._run_with_typing(message.chat_id, self.session.send_text(text_to_send))
+        await self._run_with_typing(message.chat_id, session.send_text(text_to_send))
 
     async def _handle_agent_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -463,9 +534,9 @@ class BotInstance:
             return
         if not self._authorized(update):
             return
-        self.current_chat_id = message.chat_id
+        session = self._get_or_create_session(message.chat_id)
         command_text = normalize_telegram_slash_command(message.text)
-        await self._run_with_typing(message.chat_id, self.session.send_text(command_text))
+        await self._run_with_typing(message.chat_id, session.send_text(command_text))
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -474,32 +545,31 @@ class BotInstance:
         await query.answer()
         if not self._authorized(update):
             return
-        if not self.session.pending_interaction:
+        query_message = query.message
+        chat_id = getattr(query_message, "chat_id", None) if query_message else None
+        if chat_id is None:
+            return
+        session = self.sessions.get(chat_id)
+        if not session or not session.pending_interaction:
             await query.edit_message_reply_markup(reply_markup=None)
             return
         choice = (query.data or "").split(":", 1)[-1]
         if choice == "custom":
-            self.pending_freeform = PendingFreeformReply(
-                interaction_kind=self.session.pending_interaction.kind,
-                prompt=self.session.pending_interaction.prompt,
+            self.pending_freeforms[chat_id] = PendingFreeformReply(
+                interaction_kind=session.pending_interaction.kind,
+                prompt=session.pending_interaction.prompt,
             )
-            query_message = query.message
             if query_message and hasattr(query_message, "reply_text"):
                 await self._safe_reply(query_message, "Send the next text message as your custom reply.")  # type: ignore[arg-type]
             return
-        value = self._option_by_id(choice)
+        value = self._option_by_id(chat_id, choice)
         if not value:
-            query_message = query.message
             if query_message and hasattr(query_message, "reply_text"):
                 await self._safe_reply(query_message, "That option is no longer available.")  # type: ignore[arg-type]
             return
-        query_message = query.message
-        chat_id = getattr(query_message, "chat_id", None) if query_message else None
-        if chat_id:
-            self.current_chat_id = chat_id
-        await self._run_with_typing(chat_id, self.session.send_text(value))
-        self.session.pending_interaction = None
-        self.pending_freeform = None
+        await self._run_with_typing(chat_id, session.send_text(value))
+        session.pending_interaction = None
+        self.pending_freeforms.pop(chat_id, None)
         if query_message and hasattr(query_message, "reply_text"):
             await self._safe_reply(query_message, f"Selected: {value}")  # type: ignore[arg-type]
 
@@ -509,18 +579,18 @@ class BotInstance:
         message = update.effective_message
         if message is None or not message.photo:
             return
-        self.current_chat_id = message.chat_id
+        session = self._get_or_create_session(message.chat_id)
         photo = message.photo[-1]
         tg_file = await photo.get_file()
-        session_dir = self.session.status().session_dir
+        session_dir = session.status().session_dir
         if session_dir is None:
-            await self.session.start()
-            session_dir = self.session.status().session_dir
+            await session.start()
+            session_dir = session.status().session_dir
         assert session_dir is not None
         target = Path(session_dir) / "media" / f"photo-{int(time.time())}.jpg"
         path = await self.media.save_telegram_file(tg_file, target)
         prompt = f"User uploaded an image.\nLocal file path: {path}\nCaption: {message.caption or '(none)'}"
-        await self._run_with_typing(message.chat_id, self.session.send_text(prompt))
+        await self._run_with_typing(message.chat_id, session.send_text(prompt))
         await self._safe_reply(message, f"Image saved and forwarded: {path.name}")
 
     async def _handle_image_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -529,18 +599,18 @@ class BotInstance:
         message = update.effective_message
         if message is None or message.document is None:
             return
-        self.current_chat_id = message.chat_id
+        session = self._get_or_create_session(message.chat_id)
         tg_file = await message.document.get_file()
-        session_dir = self.session.status().session_dir
+        session_dir = session.status().session_dir
         if session_dir is None:
-            await self.session.start()
-            session_dir = self.session.status().session_dir
+            await session.start()
+            session_dir = session.status().session_dir
         assert session_dir is not None
         filename = message.document.file_name or f"image-{int(time.time())}"
         target = Path(session_dir) / "media" / filename
         path = await self.media.save_telegram_file(tg_file, target)
         prompt = f"User uploaded an image document.\nLocal file path: {path}\nCaption: {message.caption or '(none)'}"
-        await self._run_with_typing(message.chat_id, self.session.send_text(prompt))
+        await self._run_with_typing(message.chat_id, session.send_text(prompt))
         await self._safe_reply(message, f"Image saved and forwarded: {path.name}")
 
     async def _handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -549,19 +619,19 @@ class BotInstance:
         message = update.effective_message
         if message is None or message.voice is None:
             return
-        self.current_chat_id = message.chat_id
+        session = self._get_or_create_session(message.chat_id)
         tg_file = await message.voice.get_file()
-        session_dir = self.session.status().session_dir
+        session_dir = session.status().session_dir
         if session_dir is None:
-            await self.session.start()
-            session_dir = self.session.status().session_dir
+            await session.start()
+            session_dir = session.status().session_dir
         assert session_dir is not None
         target = Path(session_dir) / "media" / f"voice-{int(time.time())}.ogg"
         path = await self.media.save_telegram_file(tg_file, target)
         try:
             transcript = await self.media.transcribe(path)
             payload = f"User uploaded a voice message.\nLocal file path: {path}\nTranscript:\n{transcript}"
-            await self._run_with_typing(message.chat_id, self.session.send_text(payload))
+            await self._run_with_typing(message.chat_id, session.send_text(payload))
             await self._safe_reply(message, "Voice transcribed and forwarded.")
         except Exception as exc:
             logger.exception("[%s] Voice transcription failed", self.bot_cfg.name)
@@ -588,12 +658,12 @@ class BotInstance:
         if chat_id is None:
             await operation
             return
-        self._stop_typing_sync()
-        self.typing_task = asyncio.create_task(self._typing_loop(chat_id))
+        self._stop_typing_sync(chat_id)
+        self.typing_tasks[chat_id] = asyncio.create_task(self._typing_loop(chat_id))
         try:
             await operation
         finally:
-            await self._stop_typing()
+            await self._stop_typing(chat_id)
 
     async def _typing_loop(self, chat_id: int) -> None:
         try:
@@ -607,18 +677,20 @@ class BotInstance:
         except TelegramError as exc:
             logger.error("[%s] Telegram error during typing: %s", self.bot_cfg.name, exc)
 
-    def _stop_typing_sync(self) -> None:
-        if self.typing_task is not None:
-            self.typing_task.cancel()
-            self.typing_task = None
+    def _stop_typing_sync(self, chat_id: int) -> None:
+        task = self.typing_tasks.get(chat_id)
+        if task is not None:
+            task.cancel()
+            self.typing_tasks.pop(chat_id, None)
 
-    async def _stop_typing(self) -> None:
-        if self.typing_task is None:
+    async def _stop_typing(self, chat_id: int) -> None:
+        task = self.typing_tasks.get(chat_id)
+        if task is None:
             return
-        self.typing_task.cancel()
+        task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await self.typing_task
-        self.typing_task = None
+            await task
+        self.typing_tasks.pop(chat_id, None)
 
 
 class MultiAgentRunner:
