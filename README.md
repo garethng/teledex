@@ -1,15 +1,39 @@
 # teledex
 
-Bridge a local interactive `codex` session to Telegram.
+`teledex` is a macOS CLI bridge that lets you operate a local `codex` workflow from Telegram.
 
-## Features
+It runs as a local process on your Mac, binds to a single Telegram chat with a one-time pairing
+code, forwards messages to `codex`, and sends the replies back to Telegram.
 
-- Pair a single Telegram chat with a one-time code printed in the local terminal
-- Proxy a local Codex PTY session to Telegram
-- Stream Codex output back to Telegram
-- Support inline keyboard replies for approvals and plan questions
-- Download Telegram images and voice messages into a per-session directory
-- Transcribe voice messages with `faster-whisper` when installed
+## What It Does
+
+- Pair one Telegram chat to one local bridge instance with a one-time code
+- Forward Telegram text messages to `codex`
+- Keep multi-turn context by resuming the same Codex thread between messages
+- Inject a global `Memory.md` file into every Codex request
+- Support Telegram inline buttons for approval-like and plan-question interactions
+- Accept Telegram image uploads and pass local file paths into Codex
+- Accept Telegram voice messages and transcribe them with `faster-whisper`
+- Show Telegram `typing...` while Codex is still working
+
+## How It Works
+
+`teledex` does not drive the interactive Codex TUI anymore.
+
+Instead, it uses:
+
+- `codex exec --json` for the first request
+- `codex exec resume <thread_id> --json` for later requests
+
+This avoids TUI rendering issues and keeps the conversation state inside a Codex thread.
+
+## Requirements
+
+- macOS
+- Python 3.11+
+- A working local `codex` CLI installation
+- A Telegram bot token
+- Optional: `faster-whisper` if you want voice transcription
 
 ## Install
 
@@ -19,17 +43,21 @@ source .venv/bin/activate
 pip install -e .[dev]
 ```
 
-Optional voice transcription:
+Optional voice transcription support:
 
 ```bash
 pip install -e .[faster-whisper]
 ```
 
-## First Run Setup
+## First-Time Setup
 
-`teledex` no longer expects the Telegram token from environment variables.
+Run:
 
-On first run, it opens a terminal setup flow and asks for:
+```bash
+teledex init
+```
+
+The setup wizard asks for:
 
 - Telegram bot token
 - Codex command
@@ -40,28 +68,83 @@ On first run, it opens a terminal setup flow and asks for:
 - Voice transcription backend
 - Whisper model
 
-The answers are saved to `~/.teledex/config.json`.
+Configuration is stored in:
 
-`Memory.md` is injected into every Codex request as persistent context. By default, it lives at
-`~/.teledex/Memory.md` and is shared globally across workspaces.
+```text
+~/.teledex/config.json
+```
+
+## Global Memory
+
+Every Codex request includes the contents of a global memory file before the user message.
+
+Default path:
+
+```text
+~/.teledex/Memory.md
+```
+
+Use it for durable context such as:
+
+- who the user is
+- preferred response style
+- project conventions
+- persistent reminders for the bridge
 
 ## Run
+
+Start the bridge:
 
 ```bash
 teledex run
 ```
 
-You can also rerun the setup wizard explicitly:
+If the bridge is not paired yet, it prints a one-time pairing code locally. Send that code to the
+Telegram bot from the chat you want to authorize.
+
+## Telegram Usage
+
+After pairing, you can:
+
+- send plain text to talk to Codex
+- upload images
+- upload voice messages
+- tap inline buttons for structured replies
+
+Built-in bot commands:
+
+```bash
+/help
+/status
+/start_session
+/interrupt
+/reset
+```
+
+## CLI Commands
 
 ```bash
 teledex init
+teledex run
+teledex status
+teledex unpair
 ```
 
-When unpaired, `teledex` prints a pairing code locally. Send that code to your Telegram bot in a private chat to bind the chat.
+## Notes
 
-Useful commands:
+- The bridge authorizes exactly one Telegram chat at a time.
+- `Memory.md` is global, not per-project.
+- The bridge strips proxy and conflicting `CODEX_*` environment variables before invoking Codex.
+- Voice transcription is optional; if disabled, voice files are still saved locally but not
+  transcribed.
+
+## Development
+
+Run tests:
 
 ```bash
-teledex unpair
-teledex status
+.venv/bin/pytest
 ```
+
+Current test suite covers config, state, prompt composition, output cleaning, and interaction
+parsing.
